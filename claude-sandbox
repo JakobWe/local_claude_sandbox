@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Launch Claude Code, sandboxed with Docker Sandboxes (sbx), wired up to a
+# local LM Studio model via LM Studio's Anthropic-compatible API.
+#
+# Docker Sandboxes (https://www.docker.com/products/docker-sandboxes/) runs
+# the agent inside an isolated microVM with its own filesystem, Docker
+# daemon, and network, so we no longer need to build/manage our own image
+# or bind-mount a config volume by hand -- the `sbx` CLI and its built-in
+# `claude` agent handle that.
+#
+# Usage: run this from the project directory you want Claude Code to work
+# in. That directory is mounted into the sandbox as the workspace. Any
+# extra arguments are passed straight through to `claude`.
+#
+#   claude-sandbox                 # normal interactive session
+#   claude-sandbox --resume        # e.g. resume a previous session
+#
+# Configuration (override via env vars before invoking):
+#   SANDBOX_NAME     name of the persistent sandbox to create/reuse (default: claude-code-sandbox)
+#   LMSTUDIO_HOST    host where LM Studio's server is running (default: host.docker.internal)
+#   LMSTUDIO_PORT    LM Studio server port                    (default: 1234)
+#   ANTHROPIC_MODEL  model name to request, must match what's loaded in LM
+#                    Studio (default: microsoft/phi-4-mini-reasoning). Must
+#                    NOT be left empty or set to a real Anthropic model id --
+#                    Claude Code then assumes it's talking to that real
+#                    model (wrong branding, wrong context window, and it
+#                    ignores CLAUDE_CODE_MAX_CONTEXT_TOKENS/AUTO_COMPACT_WINDOW
+#                    below, which only apply to models it doesn't recognize).
+#   CLAUDE_CODE_MAX_CONTEXT_TOKENS  the loaded model's real context window, in
+#                    tokens (default: 50000, our LM Studio model's window)
+#   CLAUDE_CODE_AUTO_COMPACT_WINDOW  token count at which auto-compact kicks
+#                    in (default: 40000, 80% of the max, leaving headroom
+#                    for the response plus tool-call overhead)
+#
+# Requirements:
+#   - LM Studio's local server must be running with "Serve on Local Network"
+#     enabled (it defaults to binding 127.0.0.1 only, which the sandbox
+#     can't reach) and its Anthropic-compatible API turned on.
+#   - The `sbx` CLI (Docker Sandboxes) installed and authenticated:
+#     https://docs.docker.com/ai/sandboxes/get-started/
+#   - On first run you'll be prompted to pick a network policy; any preset
+#     works since we explicitly allow the LM Studio host/port below.
+
+set -euo pipefail
+
+SANDBOX_NAME="${SANDBOX_NAME:-claude-code-sandbox}"
+LMSTUDIO_HOST="${LMSTUDIO_HOST:-host.docker.internal}"
+LMSTUDIO_PORT="${LMSTUDIO_PORT:-1234}"
+ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-microsoft/phi-4-mini-reasoning}"
+# Context window (in tokens) of the model loaded in LM Studio. Claude Code
+# can't auto-detect this for a custom/unknown model, so without it the CLI
+# assumes a default window for auto-compact purposes.
+CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-80000}"
+# Trigger auto-compact at 80% of the window, leaving headroom for the
+# response itself plus tool-call/result overhead.
+CLAUDE_CODE_AUTO_COMPACT_WINDOW="${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-75000}"
+
+if ! command -v sbx >/dev/null 2>&1; then
+  echo "error: 'sbx' (Docker Sandboxes CLI) not found." >&2
+  echo "Install it: https://docs.docker.com/ai/sandboxes/get-started/" >&2
+  exit 1
+fi
+
+# Sandboxes reach the outside world through a governed HTTP(S) proxy, which
+# rewrites host.docker.internal to localhost before evaluating policy -- so
+# the allow-rule has to name "localhost:<port>", not the original host, or
+# every request gets a 403 "blocked by default deny policy".
+sbx policy allow network "localhost:${LMSTUDIO_PORT}" >/dev/null
+
+ANTHROPIC_ENV=(
+  -e "ANTHROPIC_BASE_URL=http://${LMSTUDIO_HOST}:${LMSTUDIO_PORT}"
+  -e "ANTHROPIC_API_KEY=lm-studio-local"
+)
+ANTHROPIC_ENV+=(
+  -e "ANTHROPIC_MODEL=${ANTHROPIC_MODEL}"
+  -e "CLAUDE_CODE_MAX_CONTEXT_TOKENS=${CLAUDE_CODE_MAX_CONTEXT_TOKENS}"
+  -e "CLAUDE_CODE_AUTO_COMPACT_WINDOW=${CLAUDE_CODE_AUTO_COMPACT_WINDOW}"
+)
+
+# `sbx run --name` creates the sandbox on first use and reattaches to the
+# same (persistent) one afterwards, so login state under ~/.claude inside
+# the sandbox survives across invocations without a separate config volume.
+exec sbx run --name "$SANDBOX_NAME" "${ANTHROPIC_ENV[@]}" claude -- "$@"
